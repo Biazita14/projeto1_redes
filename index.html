@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>WAF & Honeypot Dashboard</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e2f; color: #fff; margin: 0; padding: 20px; }
+        h1 { color: #00d2ff; }
+        .container { display: flex; gap: 20px; flex-wrap: wrap; }
+        .card { background: #27293d; padding: 20px; border-radius: 8px; flex: 1; min-width: 300px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
+        .card h2 { margin-top: 0; color: #ff3366; }
+        input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #444; background: #1e1e2f; color: #fff; box-sizing: border-box; }
+        button { background: #00d2ff; color: #1e1e2f; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; margin-top: 5px; }
+        button:hover { background: #0099cc; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; font-size: 14px; }
+        th { background: #1e1e2f; color: #00d2ff; }
+        .badge { background: #ff3366; color: white; padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+        pre { background: #1e1e2f; padding: 10px; border-radius: 4px; overflow-x: auto; color: #a9b7c6; min-height: 50px; }
+    </style>
+</head>
+<body>
+
+    <h1>Web Application Firewall (WAF) & SOC Dashboard</h1>
+    <p>Monitorização de Segurança em Tempo Real sobre Sockets TCP/HTTP bruto.</p>
+
+    <div class="container">
+        <!-- Card 1: Simulação de Ataques -->
+        <div class="card">
+            <h2>Simular Ataque Web</h2>
+            <p>Envie requisições de teste para validar o bloqueio do WAF:</p>
+            
+            <button onclick="testAttack('/test?id=1 OR 1=1')">1. Simular SQL Injection (GET)</button>
+            <button onclick="testAttack('/test?q=<script>alert(1)</script>')">2. Simular XSS (GET)</button>
+            <button onclick="testAttack('/../../etc/passwd')">3. Simular Path Traversal (GET)</button>
+            
+            <hr style="border-color: #444; margin: 15px 0;">
+            
+            <label>Testar Payload Customizado via POST:</label>
+            <input type="text" id="customPayload" value="username=admin' OR '1'='1">
+            <button onclick="testPostAttack()">Enviar POST Customizado</button>
+
+            <h3>Resposta do Servidor:</h3>
+            <pre id="responseOutput">Aguardando teste...</pre>
+        </div>
+
+        <!-- Card 2: Dashboard do SOC (Logs de Ataque) -->
+        <div class="card">
+            <h2>Logs de Incidentes Detectados</h2>
+            <button onclick="fetchLogs()">Atualizar Logs de Segurança</button>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Hora</th>
+                        <th>IP Origem</th>
+                        <th>Tipo de Ataque</th>
+                        <th>Payload</th>
+                    </tr>
+                </thead>
+                <tbody id="logsTable">
+                    <tr><td colspan="4">Nenhum ataque registrado até o momento.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        function testAttack(path) {
+            document.getElementById('responseOutput').innerText = "A enviar requisição...";
+            fetch(path)
+                .then(res => res.text())
+                .then(data => {
+                    document.getElementById('responseOutput').innerText = data;
+                    fetchLogs();
+                })
+                .catch(err => {
+                    document.getElementById('responseOutput').innerText = "Erro ao conectar ao servidor: " + err;
+                });
+        }
+
+        function testPostAttack() {
+            document.getElementById('responseOutput').innerText = "A enviar POST...";
+            const payload = document.getElementById('customPayload').value;
+            fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: payload
+            })
+            .then(res => res.text())
+            .then(data => {
+                document.getElementById('responseOutput').innerText = data;
+                fetchLogs();
+            })
+            .catch(err => {
+                document.getElementById('responseOutput').innerText = "Erro ao conectar ao servidor: " + err;
+            });
+        }
+
+        function fetchLogs() {
+            fetch('/api/logs')
+                .then(res => res.json())
+                .then(logs => {
+                    const tbody = document.getElementById('logsTable');
+                    if (!logs || logs.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="4">Nenhum ataque registrado até o momento.</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = logs.map(log => `
+                        <tr>
+                            <td>${log.timestamp}</td>
+                            <td>${log.ip}</td>
+                            <td><span class="badge">${log.type}</span></td>
+                            <td><code>${log.payload}</code></td>
+                        </tr>
+                    `).join('');
+                })
+                .catch(err => console.log("Erro ao procurar logs:", err));
+        }
+
+        // Atualiza os logs a cada 3 segundos
+        setInterval(fetchLogs, 3000);
+    </script>
+</body>
+</html>
