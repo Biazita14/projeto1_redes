@@ -1,6 +1,6 @@
 # Web Application Firewall (WAF) & SOC Dashboard 🛡️
 
-Um servidor HTTP de alto desempenho e Web Application Firewall (WAF) desenvolvido do zero em Python utilizando **Sockets TCP nativos** (sem frameworks externos como Flask ou Django). O projeto inclui um painel SOC em tempo real para monitorização e simulação de ataques cibernéticos.
+Um servidor HTTP e Web Application Firewall (WAF) desenvolvido  em Python utilizando **Sockets TCP nativos** (sem frameworks externos como Flask ou Django). O projeto inclui um painel SOC em tempo real para monitorização e simulação de ataques cibernéticos.
 
 ---
 
