@@ -1,256 +1,178 @@
-import socket
-import os
-import json
-import time
-import re
+import socket, os, json, time, re
+from urllib.parse import unquote_plus
 
+# --- CONFIGURAÇÕES GLOBAIS DE REDE E LIMITES ---
 PORT = 8080
-HOST = ''
+RATE_MAX, RATE_WINDOW = 10, 5  # Proteção Anti-DoS: máx. 10 requisições a cada 5 segundos por IP
+ATTACK_LOGS, IP_REQUESTS = [], {}  # Estruturas em memória para armazenar logs e o histórico de IPs
 
-# ESTRUTURAS DE DADOS DO WAF / HONEYPOT
+# Mapeamento de extensões para cabeçalhos Content-Type do protocolo HTTP
+MIME = {
+    "html": "text/html; charset=utf-8", 
+    "css": "text/css", 
+    "js": "application/javascript",
+    "png": "image/png", 
+    "jpg": "image/jpeg", 
+    "json": "application/json"
+}
 
-# Regras de inspeção WAF (Expressões Regulares)
-# Regras de inspeção WAF atualizadas e flexíveis
+# Regras do WAF: Expressões Regulares (Regex) para detecção de ameaças na camada de aplicação
 ATTACK_PATTERNS = {
     "Path Traversal": [
-        r"\.\.",
-        r"\/etc\/passwd",
-        r"boot\.ini"
+        r"\.\.",            # Captura a tentativa de subir diretórios (ex: ../)
+        r"\/etc\/passwd",   # Captura tentativa de ler arquivos do sistema Linux
+        r"boot\.ini"        # Captura tentativa de ler arquivos do sistema Windows
     ],
     "SQL Injection (SQLi)": [
-        r"(?i)\bOR\b.*=",
-        r"(?i)\bUNION\b",
-        r"(?i)\bSELECT\b",
-        r"(?i)1\s*=\s*1",
-        r"'"
+        r"(?i)\bOR\b.*=",   # Captura cláusula OR com igualdade (ex: OR 1=1)
+        r"(?i)\bUNION\b",   # Captura o comando UNION usado para extrair dados
+        r"(?i)\bSELECT\b",  # Captura o comando SELECT
+        r"(?i)1\s*=\s*1",   # Captura tautologias clássicas
+        r"'"                # Captura tentativa de quebra de aspa simples em queries
     ],
     "Cross-Site Scripting (XSS)": [
-        r"(?i)<script",
-        r"(?i)%3Cscript",
-        r"(?i)alert\(",
-        r"(?i)javascript:"
+        r"(?i)<script",     # Captura abertura de tags de script
+        r"(?i)%3Cscript",   # Captura a tag <script> codificada em URL
+        r"(?i)alert\(",     # Captura chamadas de funções JavaScript de alerta
+        r"(?i)javascript:" # Captura URIs maliciosas executando JS
     ]
 }
 
-# Logs de incidentes gravados pelo WAF
-ATTACK_LOGS = []
-
-# Controle de Rate Limiting por IP: { ip: [timestamp_req1, timestamp_req2, ...] }
-IP_REQUESTS = {}
-RATE_LIMIT_MAX = 10     # Máximo de requisições
-RATE_LIMIT_WINDOW = 5   # Janela de tempo em segundos
-
-# FUNÇÕES DE SEGURANÇA E AUXILIARES
-
-def check_rate_limit(ip):
-    """
-    Mecanismo de Rate Limiting: Bloqueia IPs que realizam muitas requisições
-    em um curto intervalo de tempo (Mitigação de DoS / Brute Force).
-    """
-    now = time.time()
-    if ip not in IP_REQUESTS:
-        IP_REQUESTS[ip] = []
+def inspect_request(target, body, ip):
+    """ MOTOR WAF: Inspeciona a URL e o corpo (body) da requisição em busca de padrões maliciosos. """
+    # Descodifica a URL/body (ex: transforma %20 em espaço) para analisar o texto real
+    full_text = unquote_plus(target) + "\n" + unquote_plus(body)
     
-    # Remove timestamps fora da janela de tempo
-    IP_REQUESTS[ip] = [t for t in IP_REQUESTS[ip] if now - t < RATE_LIMIT_WINDOW]
-    
-    if len(IP_REQUESTS[ip]) >= RATE_LIMIT_MAX:
-        return False  # Limite excedido
-    
-    IP_REQUESTS[ip].append(now)
-    return True
-
-def inspect_request(request_str, client_ip):
-    """
-    Motor de Inspeção WAF: Inspeciona apenas a linha de requisição (URL/método) e o corpo (body),
-    evitando falsos positivos nos cabeçalhos HTTP do navegador (como cookies e referers).
-    """
-    parts = request_str.split('\r\n\r\n')
-    headers_part = parts[0]
-    first_line = headers_part.split('\r\n')[0] if headers_part else ""
-    body_part = parts[1] if len(parts) > 1 else ""
-
-    # Analisamos apenas a linha da URL e o corpo da requisição (POST)
-    text_to_inspect = first_line + "\n" + body_part
-
+    # Percorre as regras e aplica os padrões regex sobre o texto recebido
     for attack_type, patterns in ATTACK_PATTERNS.items():
         for pattern in patterns:
-            if re.search(pattern, text_to_inspect):
-                # Log do incidente
-                log_entry = {
-                    "id": len(ATTACK_LOGS) + 1,
+            if re.search(pattern, full_text):
+                # Registra a ocorrência na memória caso encontre um ataque
+                ATTACK_LOGS.append({
+                    "id": len(ATTACK_LOGS) + 1, 
                     "timestamp": time.strftime("%H:%M:%S"),
-                    "ip": client_ip,
-                    "type": attack_type,
-                    "payload": first_line  # Registra a linha da requisição
-                }
-                ATTACK_LOGS.append(log_entry)
-                print(f"  [WAF ALERTA] ATAQUE DETECTADO [{attack_type}] de {client_ip}")
+                    "ip": ip, 
+                    "type": attack_type, 
+                    "payload": target
+                })
+                print(f"  [WAF ALERTA] {attack_type} detectado de {ip}")
                 return attack_type
     return None
 
-def get_mime_type(filename):
-    """ Mapeia extensões para Content-Type HTTP """
-    ext = filename.split('.')[-1].lower()
-    types = {
-        'html': 'text/html; charset=utf-8',
-        'css': 'text/css',
-        'js': 'application/javascript',
-        'png': 'image/png',
-        'jpg': 'image/jpeg',
-        'json': 'application/json'
-    }
-    return types.get(ext, 'text/plain')
+def check_rate_limit(ip):
+    """ PROTEÇÃO RATE LIMITING: Controla rajadas de requisições por IP na camada de transporte/sessão. """
+    now = time.time()
+    # Remove timestamps de requisições que já saíram da janela de 5 segundos
+    IP_REQUESTS[ip] = [t for t in IP_REQUESTS.get(ip, []) if now - t < RATE_WINDOW]
+    
+    # Se o IP ultrapassou 10 requisições recentes, bloqueia
+    if len(IP_REQUESTS[ip]) >= RATE_MAX:
+        return False
+        
+    IP_REQUESTS[ip].append(now)
+    return True
 
-
-# LOOP PRINCIPAL DO SERVIDOR
+def send_response(client, status_code, status_msg, body_bytes, content_type="application/json; charset=utf-8"):
+    """ CAMADA DE APLICAÇÃO: Monta a resposta HTTP válida (cabeçalho + corpo) e envia pelo socket TCP. """
+    header = (
+        f"HTTP/1.1 {status_code} {status_msg}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        f"Connection: close\r\n\r\n"
+    )
+    # Transmite o texto do cabeçalho concatenado aos bytes do corpo através do socket
+    client.sendall(header.encode('utf-8') + body_bytes)
 
 def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(5)
+    """ CAMADA DE TRANSPORTE: Inicializa o socket TCP, faz o bind na porta e lida com as conexões. """
+    # Criando socket IPv4 (AF_INET) e TCP (SOCK_STREAM)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
-    print(f"[*] WAF & HTTP Server iniciado na porta {PORT}...")
-    print(f"[*] Dashboard de Segurança acessível em: http://localhost:{PORT}")
+    # Permite reutilizar a porta 8080 imediatamente ao reiniciar o script sem erro de porta ocupada
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Faz o bind em todas as interfaces de rede na porta 8080
+    server.bind(('', PORT))
+    
+    # Coloca o socket em modo de escuta (queue de até 5 conexões pendentes)
+    server.listen(5)
+    print(f"[*] Servidor WAF & HTTP rodando em http://localhost:{PORT}")
 
     try:
         while True:
-            client_socket, addr = server_socket.accept()
-            client_ip = addr[0]
-            
-            try:
-                # 1. Verificação de Rate Limiting (Camada de Proteção Brute-Force)
-                if not check_rate_limit(client_ip):
-                    print(f"  [RATE LIMIT] IP Bloqueado por excesso de requisições: {client_ip}")
-                    res = (
-                        "HTTP/1.1 429 Too Many Requests\r\n"
-                        "Content-Type: text/html; charset=utf-8\r\n"
-                        "Retry-After: 5\r\n"
-                        "Connection: close\r\n\r\n"
-                        "<h1>429 - Bloqueado por Rate Limiting (Muitas Requisicoes)</h1>"
-                    )
-                    client_socket.sendall(res.encode())
-                    client_socket.close()
-                    continue
+            # Aguarda e aceita o Three-Way Handshake TCP do cliente
+            client, addr = server.accept()
+            ip = addr[0]
 
-                request_data = client_socket.recv(4096)
-                if not request_data:
-                    client_socket.close()
-                    continue
+            # 1. Aplica verificação de Rate Limiting antes de processar
+            if not check_rate_limit(ip):
+                body = json.dumps({"error": "Too Many Requests", "status": 429}).encode('utf-8')
+                send_response(client, 429, "Too Many Requests", body)
+                client.close()
+                continue
 
-                request_text = request_data.decode('utf-8', errors='ignore')
-                lines = request_text.split('\r\n')
-                first_line = lines[0].split(' ')
+            # 2. Recebe até 4096 bytes contínuos do fluxo TCP
+            raw_data = client.recv(4096).decode('utf-8', errors='ignore')
+            if not raw_data:
+                client.close()
+                continue
 
-                if len(first_line) < 2:
-                    client_socket.close()
-                    continue
+            # 3. Delimitação do HTTP: Separa os cabeçalhos do corpo pelo delimitador \r\n\r\n
+            parts = raw_data.split('\r\n\r\n')
+            first_line = parts[0].split('\r\n')[0].split(' ')
+            if len(first_line) < 2:
+                client.close()
+                continue
 
-                method = first_line[0]
-                path = first_line[1]
+            # Extrai o método HTTP (GET/POST) e o caminho/alvo da requisição
+            method, target = first_line[0], first_line[1]
+            body_text = parts[1] if len(parts) > 1 else ""
+            path = target.split('?')[0]
 
-                print(f"[+] Requisicao: {method} {path} - IP: {client_ip}")
+            print(f"[+] Requisicao: {method} {target} - IP: {ip}")
 
-                # 2. Inspeção Ativa de Segurança (WAF)
-                detected_attack = inspect_request(request_text, client_ip)
-                if detected_attack:
-                    body = json.dumps({
-                        "error": "Access Denied",
-                        "reason": f"WAF Blocked: {detected_attack}",
-                        "status": 403
-                    }).encode('utf-8')
-                    
-                    header = (
-                        "HTTP/1.1 403 Forbidden\r\n"
-                        "Content-Type: application/json\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        "Connection: close\r\n\r\n"
-                    )
-                    client_socket.sendall(header.encode() + body)
-                    client_socket.close()
-                    continue
+            # 4. Inspeção do WAF na camada de aplicação
+            detected_attack = inspect_request(target, body_text, ip)
+            if detected_attack:
+                body = json.dumps({"error": "Access Denied", "reason": f"WAF Blocked: {detected_attack}", "status": 403}).encode('utf-8')
+                send_response(client, 403, "Forbidden", body)
+                client.close()
+                continue
 
-                # 3. Roteamento e Respostas HTTP Válidas
+            # 5. Roteamento das URLs
+            # Rota de API: Devolve os logs de ataques para o painel em formato JSON
+            if method == 'GET' and path == '/api/logs':
+                send_response(client, 200, "OK", json.dumps(ATTACK_LOGS).encode('utf-8'))
 
-                # ROTA: Dashboard Principal (HTML)
-                if method == 'GET' and (path == '/' or path == '/index.html'):
-                    filepath = 'index.html'
-                    if os.path.exists(filepath):
-                        with open(filepath, 'rb') as f:
-                            body = f.read()
-                        header = (
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: text/html; charset=utf-8\r\n"
-                            f"Content-Length: {len(body)}\r\n"
-                            "Connection: close\r\n\r\n"
-                        )
-                        client_socket.sendall(header.encode() + body)
-                    else:
-                        res = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n404 - index.html nao encontrado"
-                        client_socket.sendall(res.encode())
+            # Rota de API: Processa requisições de teste enviadas por formulário POST
+            elif method == 'POST' and path == '/api/login':
+                res = json.dumps({"status": "sucesso", "recebido": body_text}).encode('utf-8')
+                send_response(client, 200, "OK", res)
 
-                # ROTA: API para busca dos logs de ataques em tempo real (GET)
-                elif method == 'GET' and path == '/api/logs':
-                    body = json.dumps(ATTACK_LOGS).encode('utf-8')
-                    header = (
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/json\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        "Connection: close\r\n\r\n"
-                    )
-                    client_socket.sendall(header.encode() + body)
+            # Rota para entrega de arquivos estáticos (HTML/CSS/JS)
+            elif method == 'GET':
+                filename = 'index.html' if path in ['/', '/index.html'] else os.path.basename(unquote_plus(path))
+                ext = filename.split('.')[-1].lower() if '.' in filename else ''
 
-                # ROTA: API para simular envio de dados / login (POST)
-                elif method == 'POST' and path == '/api/login':
-                    parts = request_text.split('\r\n\r\n')
-                    post_body = parts[1] if len(parts) > 1 else ""
-                    
-                    body = json.dumps({
-                        "status": "sucesso",
-                        "mensagem": "Dados processados com sucesso pelo servidor WAF.",
-                        "recebido": post_body
-                    }).encode('utf-8')
-                    
-                    header = (
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/json\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        "Connection: close\r\n\r\n"
-                    )
-                    client_socket.sendall(header.encode() + body)
-
-                # ROTA: Arquivos Estáticos ou 404
-                elif method == 'GET':
-                    filename = path.lstrip('/')
-                    if os.path.exists(filename) and os.path.isfile(filename):
-                        mime_type = get_mime_type(filename)
-                        with open(filename, 'rb') as f:
-                            body = f.read()
-                        header = (
-                            "HTTP/1.1 200 OK\r\n"
-                            f"Content-Type: {mime_type}\r\n"
-                            f"Content-Length: {len(body)}\r\n"
-                            "Connection: close\r\n\r\n"
-                        )
-                        client_socket.sendall(header.encode() + body)
-                    else:
-                        res = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<h1>404 - Arquivo Nao Encontrado</h1>"
-                        client_socket.sendall(res.encode())
-
+                # Se o arquivo existe na pasta e tem extensão permitida, lê e envia em bytes
+                if ext in MIME and os.path.isfile(filename):
+                    with open(filename, 'rb') as f:
+                        send_response(client, 200, "OK", f.read(), MIME[ext])
                 else:
-                    res = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n\r\n405 Method Not Allowed"
-                    client_socket.sendall(res.encode())
+                    body = json.dumps({"error": "Not Found", "status": 404}).encode('utf-8')
+                    send_response(client, 404, "Not Found", body)
+            else:
+                body = json.dumps({"error": "Method Not Allowed", "status": 405}).encode('utf-8')
+                send_response(client, 405, "Method Not Allowed", body)
 
-            except Exception as e:
-                print(f"[-] Erro ao processar requisição: {e}")
-            finally:
-                client_socket.close()
+            # Fecha a conexão TCP do cliente após responder
+            client.close()
 
     except KeyboardInterrupt:
-        print("\n[*] Servidor encerrado.")
+        print("\n[*] Servidor encerrado pelo usuario.")
     finally:
-        server_socket.close()
+        # Garante o fechamento do socket principal do servidor ao encerrar
+        server.close()
 
 if __name__ == '__main__':
     start_server()
