@@ -39,7 +39,7 @@ Um servidor HTTP de alto desempenho e Web Application Firewall (WAF) desenvolvid
    cd projeto1_redes
    python server_waf.py -> para ligar servidor
    http://localhost:8080 -> coloca no seu navegador para entrar na página
-###Testar os Ataques e a Segurança
+## Testar os Ataques e a Segurança
 
 - Clica nos botões de simulação (SQL Injection, XSS, Path Traversal) para testar os bloqueios do WAF.
 
