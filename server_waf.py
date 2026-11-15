@@ -53,7 +53,7 @@ def inspect_request(target, body, ip):
                     "timestamp": time.strftime("%H:%M:%S"),
                     "ip": ip, 
                     "type": attack_type, 
-                    "payload": target
+                    "payload": f"{target} | Body: {body}" if body else target
                 })
                 print(f"  [WAF ALERTA] {attack_type} detectado de {ip}")
                 return attack_type
