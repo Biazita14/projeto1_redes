@@ -34,7 +34,7 @@ ATTACK_PATTERNS = {
         r"(?i)<script",     # Captura abertura de tags de script
         r"(?i)%3Cscript",   # Captura a tag <script> codificada em URL
         r"(?i)alert\(",     # Captura chamadas de funções JavaScript de alerta
-        r"(?i)javascript:" # Captura URIs maliciosas executando JS
+        r"(?i)javascript:"  # Captura URIs maliciosas executando JS
     ]
 }
 
@@ -82,6 +82,11 @@ def send_response(client, status_code, status_msg, body_bytes, content_type="app
     )
     # Transmite o texto do cabeçalho concatenado aos bytes do corpo através do socket
     client.sendall(header.encode('utf-8') + body_bytes)
+    try:
+        # Encerramento gracioso da escrita (TCP FIN) para evitar TCP RST no Windows
+        client.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
 
 def start_server():
     """ CAMADA DE TRANSPORTE: Inicializa o socket TCP, faz o bind na porta e lida com as conexões. """
@@ -94,8 +99,8 @@ def start_server():
     # Faz o bind em todas as interfaces de rede na porta 8080
     server.bind(('', PORT))
     
-    # Coloca o socket em modo de escuta (queue de até 5 conexões pendentes)
-    server.listen(5)
+    # Coloca o socket em modo de escuta (queue de até 50 conexões pendentes)
+    server.listen(50)
     print(f"[*] Servidor WAF & HTTP rodando em http://localhost:{PORT}")
 
     try:
@@ -106,6 +111,12 @@ def start_server():
 
             # 1. Aplica verificação de Rate Limiting antes de processar
             if not check_rate_limit(ip):
+                try:
+                    # Drena bytes pendentes do cliente antes de fechar para evitar WinError 10053
+                    client.settimeout(0.05)
+                    client.recv(4096)
+                except OSError:
+                    pass
                 body = json.dumps({"error": "Too Many Requests", "status": 429}).encode('utf-8')
                 send_response(client, 429, "Too Many Requests", body)
                 client.close()
@@ -129,7 +140,7 @@ def start_server():
             body_text = parts[1] if len(parts) > 1 else ""
             path = target.split('?')[0]
 
-            print(f"[+] Requisicao: {method} {target} - IP: {ip}")
+            print(f"[+] Requisicao: {method} {target} | IP: {ip}")
 
             # 4. Inspeção do WAF na camada de aplicação
             detected_attack = inspect_request(target, body_text, ip)

@@ -3,22 +3,21 @@ import json
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Endereço do Servidor WAF alvo
-WAF_HOST = '127.0.0.1'
-WAF_PORT = 8080
-
-# Porta da Interface Visual do Cliente
-CLIENT_UI_PORT = 9090
+# --- CONFIGURAÇÕES GLOBAIS DE REDE E PORTAS ---
+WAF_HOST = '127.0.0.1'   # Endereço IP do Servidor WAF alvo
+WAF_PORT = 8080          # Porta TCP onde o Servidor WAF está escutando
+CLIENT_UI_PORT = 9090    # Porta local da interface visual de controle do cliente
 
 def send_raw_tcp_http(method, path, body="", content_type="application/x-www-form-urlencoded"):
-    """
-    NÚCLEO DO CLIENTE (CAMADA DE TRANSPORTE & APLICAÇÃO):
-    Abre um socket IPv4/TCP puro, monta a string HTTP/1.1 manualmente com \\r\\n\\r\\n,
-    envia os bytes pela rede e lê a resposta bruta do servidor WAF.
-    """
+    """ CAMADA DE TRANSPORTE & APLICAÇÃO: Abre socket TCP puro, monta o pacote HTTP/1.1 e lê a resposta. """
+    # Codifica espaços em branco na URL (%20) para não quebrar a primeira linha do protocolo HTTP/1.1
+    path = path.replace(" ", "%20")
+
+    # Criando socket IPv4 (AF_INET) e TCP (SOCK_STREAM) com timeout de 5 segundos
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.settimeout(5)
 
+    # Converte o corpo (body) para bytes e monta os cabeçalhos obrigatórios do HTTP/1.1
     body_bytes = body.encode('utf-8')
     headers = (
         f"{method} {path} HTTP/1.1\r\n"
@@ -27,30 +26,39 @@ def send_raw_tcp_http(method, path, body="", content_type="application/x-www-for
         f"Connection: close\r\n"
     )
 
+    # Se for requisição POST, inclui o tipo e o tamanho exato do payload em bytes
     if method == "POST":
         headers += (
             f"Content-Type: {content_type}\r\n"
             f"Content-Length: {len(body_bytes)}\r\n"
         )
 
+    # Concatena cabeçalhos + delimitador obrigatório (\r\n\r\n) + corpo da mensagem em bytes
     raw_request_bytes = headers.encode('utf-8') + b"\r\n" + body_bytes
     raw_request_str = raw_request_bytes.decode('utf-8', errors='replace')
 
     try:
-        # 1. Three-Way Handshake TCP
+        # 1. Estabelece a conexão TCP (Three-Way Handshake) com o servidor WAF
         client.connect((WAF_HOST, WAF_PORT))
 
-        # 2. Envio dos bytes pelo canal TCP
+        # 2. Transmite todos os bytes da requisição HTTP pelo canal TCP
         client.sendall(raw_request_bytes)
 
-        # 3. Recebimento dos pacotes de resposta
+        # 3. Recebe a resposta do servidor em blocos (chunks) de até 4096 bytes até o fim do fluxo
         chunks = []
         while True:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
+            try:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            except ConnectionAbortedError:
+                # Se o servidor encerrar abruptamente após responder (TCP RST), aproveita o que já foi lido
+                if chunks:
+                    break
+                raise
 
+        # Decodifica a resposta completa e separa a linha de status (ex: HTTP/1.1 200 OK)
         full_response = b"".join(chunks).decode('utf-8', errors='replace')
         parts = full_response.split('\r\n\r\n', 1)
         status_line = parts[0].split('\r\n')[0] if parts[0] else "Sem resposta"
@@ -63,6 +71,7 @@ def send_raw_tcp_http(method, path, body="", content_type="application/x-www-for
         }
 
     except ConnectionRefusedError:
+        # Trata o erro caso o server_waf.py ainda não esteja rodando na porta 8080
         return {
             "ok": False,
             "status_line": "ERRO DE CONEXÃO (Connection Refused)",
@@ -70,6 +79,7 @@ def send_raw_tcp_http(method, path, body="", content_type="application/x-www-for
             "raw_response": f"Não foi possível conectar em {WAF_HOST}:{WAF_PORT}.\nVerifique se o server_waf.py está rodando!"
         }
     except Exception as e:
+        # Captura falhas gerais de timeout ou rede no socket
         return {
             "ok": False,
             "status_line": "ERRO NO SOCKET",
@@ -77,9 +87,11 @@ def send_raw_tcp_http(method, path, body="", content_type="application/x-www-for
             "raw_response": str(e)
         }
     finally:
+        # Garante o fechamento do socket TCP e a liberação da porta efêmera no sistema operacional
         client.close()
 
 
+# --- INTERFACE WEB DE CONTROLE E INSPEÇÃO DE PACOTES (WIRE VIEW) ---
 HTML_UI = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -156,6 +168,7 @@ HTML_UI = """<!DOCTYPE html>
     </div>
 
     <script>
+        // Envia comando para o backend Python disparar a requisição via socket TCP nativo
         async function disparar(method, path, body) {
             document.getElementById('statusBadge').className = 'status-badge';
             document.getElementById('statusBadge').innerText = 'Abrindo socket TCP...';
@@ -169,16 +182,23 @@ HTML_UI = """<!DOCTYPE html>
 
             const badge = document.getElementById('statusBadge');
             badge.innerText = data.status_line;
+
+            // Aplica a cor semântica de acordo com o código de status HTTP retornado
             if (data.status_line.includes('200')) {
                 badge.className = 'status-badge status-200';
-            } else {
+            } else if (data.status_line.includes('429')) {
+                badge.className = 'status-badge status-429';
+            } else if (data.status_line.includes('403')) {
                 badge.className = 'status-badge status-403';
+            } else {
+                badge.className = 'status-badge status-err';
             }
 
             document.getElementById('rawRequestBox').innerText = data.raw_request;
             document.getElementById('rawResponseBox').innerText = data.raw_response;
         }
 
+        // Lê os campos do formulário customizado e dispara o pacote
         function dispararCustom() {
             const method = document.getElementById('customMethod').value;
             const path = document.getElementById('customPath').value;
@@ -186,9 +206,37 @@ HTML_UI = """<!DOCTYPE html>
             disparar(method, path, body);
         }
 
+        // Dispara até 12 requisições em sequência para testar o limite de Rate Limiting (429)
         async function dispararRajada() {
+            const badge = document.getElementById('statusBadge');
             for (let i = 1; i <= 12; i++) {
-                await disparar('GET', '/api/logs', '');
+                badge.className = 'status-badge';
+                badge.innerText = `Rajada Anti-DoS: enviando pacote ${i}/12...`;
+
+                const res = await fetch('/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ method: 'GET', path: '/api/logs', body: '' })
+                });
+                const data = await res.json();
+
+                document.getElementById('rawRequestBox').innerText = data.raw_request;
+                document.getElementById('rawResponseBox').innerText = data.raw_response;
+
+                if (data.status_line.includes('429')) {
+                    badge.innerText = `Bloqueado na req ${i}/12: ${data.status_line}`;
+                    badge.className = 'status-badge status-429';
+                    break;
+                } else if (data.status_line.includes('200')) {
+                    badge.innerText = `Req ${i}/12: ${data.status_line}`;
+                    badge.className = 'status-badge status-200';
+                } else {
+                    badge.innerText = `Req ${i}/12: ${data.status_line}`;
+                    badge.className = 'status-badge status-err';
+                    break;
+                }
+
+                await new Promise(r => setTimeout(r, 120));
             }
         }
     </script>
@@ -198,15 +246,18 @@ HTML_UI = """<!DOCTYPE html>
 
 
 class ClientUIHandler(BaseHTTPRequestHandler):
+    """ SERVIDOR LOCAL DE CONTROLE: Serve a página HTML do cliente e recebe os comandos dos botões. """
     def log_message(self, format, *args):
-        pass  # Mantém o terminal limpo
+        pass  # Suprime logs de acesso da UI para manter o terminal limpo
 
+    # Rota GET: Entrega a interface web do cliente para o navegador
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.end_headers()
         self.wfile.write(HTML_UI.encode('utf-8'))
 
+    # Rota POST /send: Aciona a função de socket TCP nativo e devolve o resultado em JSON
     def do_POST(self):
         if self.path == '/send':
             length = int(self.headers.get('Content-Length', 0))
@@ -222,7 +273,8 @@ class ClientUIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode('utf-8'))
 
 
-if __name__ == '__main__':
+def start_client():
+    """ INICIALIZAÇÃO DO CLIENTE: Sobe a interface visual na porta 9090 e abre no navegador. """
     server_ui = HTTPServer(('127.0.0.1', CLIENT_UI_PORT), ClientUIHandler)
     url = f"http://127.0.0.1:{CLIENT_UI_PORT}"
     print(f"[*] Interface Visual do Cliente TCP rodando em: {url}")
@@ -231,4 +283,9 @@ if __name__ == '__main__':
     try:
         server_ui.serve_forever()
     except KeyboardInterrupt:
-        print("\n[*] Cliente encerrado.")
+        print("\n[*] Cliente encerrado pelo usuario.")
+    finally:
+        server_ui.server_close()
+
+if __name__ == '__main__':
+    start_client()
